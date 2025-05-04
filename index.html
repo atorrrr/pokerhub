@@ -1,0 +1,1166 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { 
+  Clock, Users, Award, SkipForward, SkipBack, Play, Pause, Coffee, Plus, Minus, 
+  AlertCircle, Save, Edit, X, Settings, History, ChevronDown, ChevronUp, Tv, 
+  Volume2, VolumeX, RefreshCw, UploadCloud, DownloadCloud, Edit2, Check, PowerOff, 
+  PauseCircle, PlayCircle, Trash2 
+} from 'lucide-react';
+// Note: You might need to install Tone.js: npm install tone
+import * as Tone from 'tone';
+
+// --- Helper Functions ---
+
+// Format time as HH:MM:SS or MM:SS if hours are zero
+const formatTime = (seconds, forceHours = false) => {
+  if (isNaN(seconds) || seconds < 0) seconds = 0;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60); // Use Math.floor to avoid fractional seconds display
+
+  if (hours > 0 || forceHours) {
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  } else {
+    return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+};
+
+// Parse MM:SS or HH:MM:SS string to seconds
+const parseTimeToSeconds = (timeString) => {
+    if (!timeString || typeof timeString !== 'string') return null;
+    const parts = timeString.split(':').map(part => parseInt(part, 10));
+    let seconds = 0;
+    if (parts.length === 3) { // HH:MM:SS
+        if (parts.some(isNaN) || parts[1] >= 60 || parts[2] >= 60 || parts.some(p => p < 0)) return null;
+        seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    } else if (parts.length === 2) { // MM:SS
+        if (parts.some(isNaN) || parts[0] >= 60 || parts[1] >= 60 || parts.some(p => p < 0)) return null;
+        seconds = parts[0] * 60 + parts[1];
+    } else {
+        return null; // Invalid format
+    }
+    return seconds;
+};
+
+
+// Default data (Ante still exists in data structure but won't be displayed/edited inline)
+const DEFAULT_BLIND_LEVELS = [
+  { small: 5, big: 10, ante: 0, duration: 15 * 60 },
+  { small: 10, big: 20, ante: 0, duration: 15 * 60 },
+  { small: 15, big: 30, ante: 0, duration: 15 * 60 },
+  { small: 25, big: 50, ante: 0, duration: 15 * 60 },
+  { small: 50, big: 100, ante: 5, duration: 15 * 60 },
+  { small: 75, big: 150, ante: 10, duration: 15 * 60 },
+  { small: 100, big: 200, ante: 25, duration: 15 * 60 },
+  { small: 150, big: 300, ante: 25, duration: 12 * 60 },
+  { small: 200, big: 400, ante: 50, duration: 12 * 60 },
+  { small: 250, big: 500, ante: 50, duration: 12 * 60 },
+  { small: 300, big: 600, ante: 75, duration: 10 * 60 },
+  { small: 400, big: 800, ante: 100, duration: 10 * 60 },
+  { small: 500, big: 1000, ante: 100, duration: 10 * 60 },
+  { small: 600, big: 1200, ante: 200, duration: 10 * 60 },
+  { small: 800, big: 1600, ante: 200, duration: 10 * 60 },
+  { small: 1000, big: 2000, ante: 300, duration: 10 * 60 },
+];
+
+const DEFAULT_BREAKS = [
+  { afterLevelIndex: 3, duration: 10 * 60 }, // Break after level 4 (index 3)
+  { afterLevelIndex: 7, duration: 15 * 60 }, // Break after level 8 (index 7)
+  { afterLevelIndex: 11, duration: 10 * 60 }, // Break after level 12 (index 11)
+];
+
+const LOCAL_STORAGE_KEY_STATE = 'pokerTournamentState_v2';
+const LOCAL_STORAGE_KEY_HISTORY = 'pokerTournamentHistory_v2';
+const LOCAL_STORAGE_KEY_BLINDS = 'pokerTournamentBlinds_v2';
+const LOCAL_STORAGE_KEY_BREAKS = 'pokerTournamentBreaks_v2';
+
+// --- Main Component ---
+const PokerTournamentHUD = () => {
+  // --- State ---
+
+  // Tournament Settings & Info
+  const [tournamentName, setTournamentName] = useState("Poker Night Tournament");
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [editedName, setEditedName] = useState(tournamentName);
+  const [startingPlayers, setStartingPlayers] = useState(9);
+  const [playerCount, setPlayerCount] = useState(9);
+  const [eliminatedPlayers, setEliminatedPlayers] = useState([]); // { name: string, time: Date, position: number }[]
+  const [playerToEliminate, setPlayerToEliminate] = useState("");
+
+  // Timers & Levels
+  const [tournamentTime, setTournamentTime] = useState(0); // Total elapsed time
+  const [levelTimeElapsed, setLevelTimeElapsed] = useState(0); // Time elapsed in current level/break
+  const [currentLevelIndex, setCurrentLevelIndex] = useState(0);
+  const [isRunning, setIsRunning] = useState(false); // Master timer running?
+  const [isEditingLevelTime, setIsEditingLevelTime] = useState(false);
+  const [editedLevelTimeInput, setEditedLevelTimeInput] = useState("");
+
+  // Blind Editing State
+  const [editingBlind, setEditingBlind] = useState(null); // null | 'small' | 'big'
+  const [editedBlindValue, setEditedBlindValue] = useState(""); // string value from input
+
+  // Blinds & Breaks
+  const [blindLevels, setBlindLevels] = useState(() => {
+     try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_BLINDS);
+      return saved ? JSON.parse(saved) : DEFAULT_BLIND_LEVELS;
+    } catch { return DEFAULT_BLIND_LEVELS; }
+  });
+  const [breaks, setBreaks] = useState(() => {
+     try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_BREAKS);
+      return saved ? JSON.parse(saved) : DEFAULT_BREAKS;
+    } catch { return DEFAULT_BREAKS; }
+  });
+  const [onScheduledBreak, setOnScheduledBreak] = useState(false);
+  const [currentBreakDuration, setCurrentBreakDuration] = useState(0);
+
+  // Manual Break
+  const [onManualBreak, setOnManualBreak] = useState(false);
+  const [manualBreakInputMinutes, setManualBreakInputMinutes] = useState(5);
+  const [manualBreakTotalDuration, setManualBreakTotalDuration] = useState(0);
+
+  // Player Clock (Call the Clock)
+  const [playerClockTime, setPlayerClockTime] = useState(60); // Default 60 seconds
+  const [playerClockRunning, setPlayerClockRunning] = useState(false);
+  const [playerClockPaused, setPlayerClockPaused] = useState(false);
+
+  // UI State
+  const [showHistory, setShowHistory] = useState(false);
+  const [showLevelEditor, setShowLevelEditor] = useState(false);
+  const [showBreakEditor, setShowBreakEditor] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [editingLevelIndex, setEditingLevelIndex] = useState(null); // For level editor modal
+  const [editingBreakIndex, setEditingBreakIndex] = useState(null); // For break editor modal
+  const [tempBlindLevels, setTempBlindLevels] = useState(blindLevels); // For editing modal
+  const [tempBreaks, setTempBreaks] = useState(breaks); // For editing modal
+
+  // Sound
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const synth = useRef(null); // Ref to store the Tone.js synth
+
+  // History
+  const [gameHistory, setGameHistory] = useState(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_HISTORY);
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
+
+  // --- Effects ---
+
+  // Initialize Tone.js Synth
+  useEffect(() => {
+    synth.current = new Tone.Synth().toDestination();
+  }, []);
+
+  // Sound Player Function
+  const playSound = useCallback((note, duration = '8n') => {
+    if (soundEnabled && synth.current && Tone.context.state !== 'running') {
+      Tone.start().catch(e => console.warn("Tone.start() failed:", e));
+    }
+    if (soundEnabled && synth.current && Tone.context.state === 'running') {
+      try {
+        synth.current.triggerAttackRelease(note, duration, Tone.now());
+      } catch (error) {
+        console.error("Error playing sound:", error);
+      }
+    } else if (soundEnabled && !synth.current) {
+        console.warn("Synth not initialized.");
+    } else if (soundEnabled && Tone.context.state !== 'running') {
+        console.warn("Audio context not running. User interaction might be required.");
+    }
+  }, [soundEnabled]);
+
+  // Main Tournament Timer Logic
+  useEffect(() => {
+    let interval = null;
+    // Timer only runs if isRunning is true AND we are not currently editing the level time OR a blind
+    if (isRunning && !isEditingLevelTime && !editingBlind) {
+      interval = setInterval(() => {
+        setTournamentTime(prev => prev + 1);
+
+        // Handle Level/Break Time Progression
+        if (onManualBreak) {
+          // Manual Break Countdown
+          setLevelTimeElapsed(prevManualTime => {
+            const newManualTime = prevManualTime - 1;
+            if (newManualTime <= 0) {
+              playSound('C5'); // Sound for manual break end
+              setOnManualBreak(false);
+              setManualBreakTotalDuration(0);
+              setIsRunning(false); // Pause timer after manual break ends automatically
+               return 0; // Reset level timer
+            }
+            return newManualTime;
+          });
+        } else {
+          // Regular Level or Scheduled Break Countup/Countdown
+          setLevelTimeElapsed(prevLevelTime => {
+            const newLevelTime = prevLevelTime + 1;
+            const currentDuration = onScheduledBreak
+              ? currentBreakDuration
+              : blindLevels[currentLevelIndex]?.duration ?? Infinity;
+
+            if (newLevelTime >= currentDuration) {
+              if (onScheduledBreak) {
+                // Scheduled Break Finished
+                playSound('C5');
+                setOnScheduledBreak(false);
+                setCurrentBreakDuration(0);
+                // Advance to the level *after* the break
+                if (currentLevelIndex < blindLevels.length - 1) {
+                  setCurrentLevelIndex(prev => prev + 1);
+                } else {
+                  setIsRunning(false); // End of levels after break
+                }
+                return 0; // Reset timer for the new level
+              } else {
+                // Level Finished
+                const breakInfo = breaks.find(b => b.afterLevelIndex === currentLevelIndex);
+                if (breakInfo) {
+                  // Start Scheduled Break
+                  playSound('G4', '4n');
+                  setOnScheduledBreak(true);
+                  setCurrentBreakDuration(breakInfo.duration);
+                  return 0; // Reset timer for break duration
+                } else {
+                  // Advance to Next Level (No Break)
+                  if (currentLevelIndex < blindLevels.length - 1) {
+                    playSound('E4');
+                    setCurrentLevelIndex(prev => prev + 1);
+                    return 0; // Reset timer for new level
+                  } else {
+                    // End of Defined Levels
+                    playSound('A4', '2n');
+                    setIsRunning(false); // Stop timer
+                    return blindLevels[currentLevelIndex]?.duration ?? 0;
+                  }
+                }
+              }
+            }
+            return newLevelTime; // Continue counting
+          });
+        }
+      }, 1000);
+    }
+
+    return () => clearInterval(interval);
+  }, [
+      isRunning, isEditingLevelTime, editingBlind, // Added editingBlind dependency
+      onScheduledBreak, onManualBreak, currentLevelIndex, blindLevels,
+      breaks, currentBreakDuration, playSound, levelTimeElapsed
+    ]);
+
+
+  // Player Clock (Call the Clock) Timer Logic
+  useEffect(() => {
+    let clockInterval = null;
+    if (playerClockRunning && !playerClockPaused) {
+      clockInterval = setInterval(() => {
+        setPlayerClockTime(prevTime => {
+          if (prevTime <= 1) {
+            playSound('A5', '4n'); // Alert sound for clock end
+            setPlayerClockRunning(false);
+            setPlayerClockPaused(false); // Ensure pause state is reset
+            return 60; // Reset to default
+          }
+          // Play warning sounds closer to the end
+          if (prevTime === 11) playSound('G5', '16n');
+          if (prevTime === 10) playSound('G5', '16n');
+          if (prevTime === 9) playSound('G5', '16n');
+          if (prevTime === 8) playSound('G5', '16n');
+          if (prevTime === 7) playSound('G5', '16n');
+          if (prevTime === 6) playSound('F5', '8n');
+          if (prevTime === 5) playSound('F5', '8n');
+          if (prevTime === 4) playSound('F5', '8n');
+          if (prevTime === 3) playSound('E5', '4n');
+          if (prevTime === 2) playSound('E5', '4n');
+
+          return prevTime - 1;
+        });
+      }, 1000);
+    }
+    // Cleanup interval
+    return () => clearInterval(clockInterval);
+  }, [playerClockRunning, playerClockPaused, playSound]);
+
+  // Save state to localStorage periodically or on major changes
+   // Debounce state saving to avoid excessive writes
+  const stateSaveTimeout = useRef(null);
+  useEffect(() => {
+     // Clear any existing timeout
+    if (stateSaveTimeout.current) {
+      clearTimeout(stateSaveTimeout.current);
+    }
+    // Set a new timeout
+    stateSaveTimeout.current = setTimeout(() => {
+        const stateToSave = {
+          tournamentName,
+          startingPlayers,
+          playerCount,
+          eliminatedPlayers,
+          tournamentTime,
+          levelTimeElapsed,
+          currentLevelIndex,
+          isRunning,
+          onScheduledBreak,
+          currentBreakDuration,
+          onManualBreak,
+          manualBreakTotalDuration,
+          soundEnabled,
+        };
+        try {
+          localStorage.setItem(LOCAL_STORAGE_KEY_STATE, JSON.stringify(stateToSave));
+        } catch (e) {
+          console.error("Error saving state to localStorage:", e);
+        }
+     }, 1000); // Save state 1 second after the last change
+
+     return () => {
+       if (stateSaveTimeout.current) {
+         clearTimeout(stateSaveTimeout.current);
+       }
+     };
+
+  }, [ // Add all relevant state variables here
+      tournamentName, startingPlayers, playerCount, eliminatedPlayers, tournamentTime,
+      levelTimeElapsed, currentLevelIndex, isRunning, onScheduledBreak, currentBreakDuration,
+      onManualBreak, manualBreakTotalDuration, soundEnabled
+  ]);
+
+
+  // Save history, blinds, breaks when they change (these change less often, no debounce needed)
+   useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY_HISTORY, JSON.stringify(gameHistory));
+    } catch (e) { console.error("Error saving history:", e); }
+  }, [gameHistory]);
+
+   useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY_BLINDS, JSON.stringify(blindLevels));
+    } catch (e) { console.error("Error saving blinds:", e); }
+  }, [blindLevels]);
+
+   useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY_BREAKS, JSON.stringify(breaks));
+    } catch (e) { console.error("Error saving breaks:", e); }
+  }, [breaks]);
+
+  // --- Event Handlers ---
+
+  const handleLoadState = () => {
+    if (window.confirm("Load the last saved tournament state? This will overwrite the current state.")) {
+      try {
+        const savedStateJSON = localStorage.getItem(LOCAL_STORAGE_KEY_STATE);
+        if (savedStateJSON) {
+          const savedState = JSON.parse(savedStateJSON);
+
+          // Restore state variables carefully, providing defaults
+          setTournamentName(savedState.tournamentName ?? "Poker Night Tournament");
+          setStartingPlayers(savedState.startingPlayers ?? 9);
+          setPlayerCount(savedState.playerCount ?? 9);
+          setEliminatedPlayers(savedState.eliminatedPlayers?.map(p => ({...p, time: new Date(p.time)})) ?? []);
+          setTournamentTime(savedState.tournamentTime ?? 0);
+          setLevelTimeElapsed(savedState.levelTimeElapsed ?? 0);
+          setCurrentLevelIndex(savedState.currentLevelIndex ?? 0);
+          setIsRunning(savedState.isRunning ?? false);
+          setOnScheduledBreak(savedState.onScheduledBreak ?? false);
+          setCurrentBreakDuration(savedState.currentBreakDuration ?? 0);
+          setOnManualBreak(savedState.onManualBreak ?? false);
+          setManualBreakTotalDuration(savedState.manualBreakTotalDuration ?? 0);
+          setSoundEnabled(savedState.soundEnabled ?? true);
+
+          // Reset transient states not saved
+          setPlayerClockRunning(false);
+          setPlayerClockPaused(false);
+          setPlayerClockTime(60);
+          setPlayerToEliminate("");
+          setIsEditingName(false);
+          setShowSettings(false);
+          setIsEditingLevelTime(false);
+          setEditingBlind(null); // Ensure not editing blind on load
+
+          const savedBlinds = localStorage.getItem(LOCAL_STORAGE_KEY_BLINDS);
+          if (savedBlinds) setBlindLevels(JSON.parse(savedBlinds));
+          const savedBreaks = localStorage.getItem(LOCAL_STORAGE_KEY_BREAKS);
+          if (savedBreaks) setBreaks(JSON.parse(savedBreaks));
+
+          alert("Tournament state loaded successfully.");
+          playSound('C5');
+        } else {
+          alert("No saved tournament state found.");
+          playSound('C3');
+        }
+      } catch (e) {
+        console.error("Error loading state:", e);
+        alert("Failed to load saved state. It might be corrupted.");
+        playSound('A2');
+      }
+    }
+  };
+
+  const toggleTimer = () => {
+     // Cannot toggle timer if editing level time or blind
+     if (isEditingLevelTime || editingBlind) {
+         alert("Finish editing time or blind first.");
+         playSound('C3');
+         return;
+     }
+
+     if (!isRunning && (onScheduledBreak || onManualBreak)) {
+       // If paused on a break, resuming should *end* the break immediately
+       const wasOnScheduledBreak = onScheduledBreak;
+       setOnScheduledBreak(false);
+       setOnManualBreak(false);
+       setCurrentBreakDuration(0);
+       setManualBreakTotalDuration(0);
+       setLevelTimeElapsed(0); // Reset timer for the upcoming level
+
+       if (wasOnScheduledBreak) {
+           if (currentLevelIndex < blindLevels.length - 1) {
+                setCurrentLevelIndex(prev => prev + 1);
+                setIsRunning(true); // Start the timer for the new level
+                playSound('C4');
+           } else {
+               setIsRunning(false);
+               playSound('E3');
+           }
+       } else {
+           setIsRunning(true);
+           playSound('C4');
+       }
+
+     } else {
+       // Regular play/pause toggle
+       setIsRunning(!isRunning);
+       playSound(isRunning ? 'E3' : 'C4');
+     }
+  };
+
+
+  const goToLevel = (index) => {
+    // Allow changing level only if timer is paused and not on break or editing time/blind
+    if (!isRunning && !onManualBreak && !onScheduledBreak && !isEditingLevelTime && !editingBlind) {
+        if (index >= 0 && index < blindLevels.length) {
+          setCurrentLevelIndex(index);
+          setLevelTimeElapsed(0); // Reset timer for the selected level
+          playSound('D4');
+        }
+    } else {
+        playSound('C3'); // Indicate action is disabled
+        let message = "Pause the tournament";
+        if (onManualBreak || onScheduledBreak) message += " and ensure no break is active";
+        if (isEditingLevelTime || editingBlind) message += " and finish editing time/blinds";
+        message += " to change levels manually.";
+        alert(message);
+    }
+  };
+  const nextLevel = () => goToLevel(currentLevelIndex + 1);
+  const previousLevel = () => goToLevel(currentLevelIndex - 1);
+
+  const startManualBreak = () => {
+     // Can only start manual break if timer is paused and not editing level time or blind
+    if (!isRunning && !isEditingLevelTime && !editingBlind) {
+        if (manualBreakInputMinutes > 0) {
+          const durationSeconds = manualBreakInputMinutes * 60;
+          setOnManualBreak(true);
+          setManualBreakTotalDuration(durationSeconds);
+          setLevelTimeElapsed(durationSeconds); // Use levelTimeElapsed for countdown display
+          setOnScheduledBreak(false); // Manual break overrides scheduled
+          setIsRunning(true); // Start the timer *for the break countdown*
+          playSound('G4', '4n');
+        }
+    } else {
+        playSound('C3');
+        alert("Pause the main timer and finish any edits before starting a manual break.");
+    }
+  };
+
+  const endManualBreak = () => {
+     playSound('C5');
+     setOnManualBreak(false);
+     setManualBreakTotalDuration(0);
+     setLevelTimeElapsed(0); // Reset timer for the level that was interrupted
+     setIsRunning(false); // Ensure timer is paused after ending break manually
+  };
+
+  const saveTournamentToHistory = () => {
+     const winner = playerCount === 1 && eliminatedPlayers.length === startingPlayers - 1
+      ? eliminatedPlayers[eliminatedPlayers.length - 1]?.name
+      : (playerCount === 1 ? "Last Player Standing" : "In Progress / Unknown");
+
+    const tournamentRecord = {
+      id: Date.now(),
+      name: tournamentName,
+      date: new Date().toISOString(),
+      duration: tournamentTime,
+      players: { starting: startingPlayers, final: playerCount },
+      eliminated: JSON.parse(JSON.stringify(eliminatedPlayers)),
+      winner: winner,
+      blindStructure: JSON.parse(JSON.stringify(blindLevels)),
+      breakSchedule: JSON.parse(JSON.stringify(breaks)),
+    };
+
+    setGameHistory(prevHistory => [tournamentRecord, ...prevHistory]);
+    alert(`Tournament "${tournamentName}" saved to history.`);
+    playSound('A4');
+  };
+
+  const resetTournament = () => {
+    if (window.confirm("RESET TOURNAMENT?\n\nThis will:\n- Stop the timer\n- Reset all times to 0\n- Go back to Level 1\n- Reset player count to Starting Players\n- Clear eliminated players list\n\nIt will NOT affect History or saved Blind/Break structures.\n\nConsider saving to History first.")) {
+      if (tournamentTime > 300 && window.confirm("Save current progress to History before resetting?")) {
+        saveTournamentToHistory();
+      }
+
+      setIsRunning(false);
+      setTournamentTime(0);
+      setLevelTimeElapsed(0);
+      setCurrentLevelIndex(0);
+      setPlayerCount(startingPlayers);
+      setEliminatedPlayers([]);
+      setOnScheduledBreak(false);
+      setOnManualBreak(false);
+      setCurrentBreakDuration(0);
+      setManualBreakTotalDuration(0);
+      setPlayerClockRunning(false);
+      setPlayerClockPaused(false);
+      setPlayerClockTime(60);
+      setPlayerToEliminate("");
+      setIsEditingName(false);
+      setShowSettings(false);
+      setIsEditingLevelTime(false);
+      setEditingBlind(null); // Ensure not editing blind
+
+      playSound('C3', '2n');
+      alert("Tournament has been reset.");
+      localStorage.removeItem(LOCAL_STORAGE_KEY_STATE);
+    }
+  };
+
+  const eliminatePlayer = () => {
+    if (playerCount <= 1) {
+       alert("Cannot eliminate player. Tournament has finished or only one player remains.");
+       playSound('C3');
+       return;
+    }
+    if (playerToEliminate.trim() === "") {
+       alert("Please enter the name of the player to eliminate.");
+       playSound('C3');
+       setPlayerToEliminate("");
+       return;
+    }
+
+    const newPlayerCount = playerCount - 1;
+    setPlayerCount(newPlayerCount);
+    const now = new Date();
+    const position = startingPlayers - newPlayerCount;
+    setEliminatedPlayers(prev => [
+      ...prev,
+      { name: playerToEliminate.trim(), time: now, position: position }
+    ].sort((a, b) => b.position - a.position));
+    setPlayerToEliminate("");
+    playSound('E3');
+
+    if (newPlayerCount === 1) {
+       const winnerName = eliminatedPlayers.length === startingPlayers - 1
+         ? eliminatedPlayers[eliminatedPlayers.length - 1]?.name
+         : "Last Player Standing";
+       playSound('G5', '1n');
+       setIsRunning(false);
+       alert(`Tournament Over! Winner: ${winnerName}`);
+    }
+  };
+
+  const startPlayerClock = () => {
+    setPlayerClockTime(60);
+    setPlayerClockPaused(false);
+    setPlayerClockRunning(true);
+    playSound('F4');
+  };
+
+  const togglePausePlayerClock = () => {
+    if (playerClockRunning) {
+      setPlayerClockPaused(!playerClockPaused);
+      playSound(playerClockPaused ? 'C4' : 'E3');
+    }
+  };
+
+  const stopPlayerClock = () => {
+    setPlayerClockRunning(false);
+    setPlayerClockPaused(false);
+    setPlayerClockTime(60);
+    playSound('C3');
+  };
+
+  // --- Level/Break Editor Logic ---
+  const openLevelEditor = () => {
+    setTempBlindLevels(JSON.parse(JSON.stringify(blindLevels)));
+    setEditingLevelIndex(null);
+    setShowLevelEditor(true);
+    playSound('E4');
+  };
+
+  const saveLevelChanges = () => {
+    setBlindLevels(tempBlindLevels);
+    setShowLevelEditor(false);
+    playSound('C4');
+    alert("Blind structure updated and saved.");
+  };
+
+  const handleLevelEditChange = (index, field, value) => {
+    const newLevels = [...tempBlindLevels];
+    let numValue = parseInt(value);
+    if (isNaN(numValue) || numValue < 0) numValue = 0;
+    newLevels[index][field] = (field === 'duration') ? numValue * 60 : numValue;
+    setTempBlindLevels(newLevels);
+  };
+
+   const addLevel = () => {
+    const lastLevel = tempBlindLevels[tempBlindLevels.length - 1] || { small: 500, big: 1000, ante: 0, duration: 10 * 60 }; // Default ante to 0
+    const roundTo = (n, multiple) => Math.max(multiple, Math.round(n / multiple) * multiple);
+    const newLevel = {
+      small: roundTo(lastLevel.small * 1.5, 5),
+      big: roundTo(lastLevel.big * 1.5, 10),
+      ante: 0, // Ensure new levels added via editor also default to 0 ante
+      duration: lastLevel.duration
+    };
+    setTempBlindLevels([...tempBlindLevels, newLevel]);
+  };
+
+  const removeLevel = (index) => {
+    if (tempBlindLevels.length <= 1) {
+        alert("Cannot remove the last level.");
+        playSound('C3');
+        return;
+    }
+    if (window.confirm(`Remove Level ${index + 1}?`)) {
+        const newLevels = [...tempBlindLevels];
+        newLevels.splice(index, 1);
+        setTempBlindLevels(newLevels);
+        if (editingLevelIndex === index) setEditingLevelIndex(null);
+        else if (editingLevelIndex > index) setEditingLevelIndex(editingLevelIndex - 1);
+        playSound('E3');
+    }
+  };
+
+  // Break Editor Logic
+  const openBreakEditor = () => {
+    setTempBreaks(JSON.parse(JSON.stringify(breaks)));
+    setEditingBreakIndex(null);
+    setShowBreakEditor(true);
+    playSound('E4');
+  };
+
+  const saveBreakChanges = () => {
+    const sortedBreaks = [...tempBreaks].sort((a, b) => a.afterLevelIndex - b.afterLevelIndex);
+    setBreaks(sortedBreaks);
+    setShowBreakEditor(false);
+    playSound('C4');
+    alert("Break schedule updated and saved.");
+  };
+
+   const handleBreakEditChange = (index, field, value) => {
+    const newBreaks = [...tempBreaks];
+    let numValue = parseInt(value);
+    if (isNaN(numValue) || numValue < 0) numValue = 0;
+    if (field === 'duration') {
+      newBreaks[index][field] = numValue * 60;
+    } else {
+      newBreaks[index][field] = Math.max(0, numValue - 1);
+    }
+    setTempBreaks(newBreaks);
+  };
+
+   const addBreak = () => {
+    const lastBreak = tempBreaks.length > 0 ? tempBreaks[tempBreaks.length - 1] : { afterLevelIndex: -1 };
+    const newBreak = {
+      afterLevelIndex: lastBreak.afterLevelIndex + 4,
+      duration: 10 * 60
+    };
+    setTempBreaks([...tempBreaks, newBreak].sort((a, b) => a.afterLevelIndex - b.afterLevelIndex));
+  };
+
+  const removeBreak = (index) => {
+     if (window.confirm(`Remove this break?`)) {
+        const newBreaks = [...tempBreaks];
+        newBreaks.splice(index, 1);
+        setTempBreaks(newBreaks);
+        if (editingBreakIndex === index) setEditingBreakIndex(null);
+        else if (editingBreakIndex > index) setEditingBreakIndex(editingBreakIndex - 1);
+        playSound('E3');
+    }
+  };
+
+  // --- Level Time Editing Handlers ---
+  const handleEditLevelTime = () => {
+      if (!isRunning && !onManualBreak && !onScheduledBreak && !editingBlind) { // Check not editing blind
+          const currentRemainingSeconds = Math.max(0, (blindLevels[currentLevelIndex]?.duration ?? 0) - levelTimeElapsed);
+          setEditedLevelTimeInput(formatTime(currentRemainingSeconds));
+          setIsEditingLevelTime(true);
+          playSound('E4');
+      } else {
+          playSound('C3');
+          alert("Pause the timer, ensure no break is active, and finish blind edits to edit level time.");
+      }
+  };
+
+  const handleSaveLevelTime = () => {
+      const newRemainingSeconds = parseTimeToSeconds(editedLevelTimeInput);
+      const currentDuration = blindLevels[currentLevelIndex]?.duration ?? 0;
+
+      if (newRemainingSeconds === null || newRemainingSeconds < 0) {
+          alert("Invalid time format. Please use MM:SS.");
+          playSound('C3');
+          return;
+      }
+      if (newRemainingSeconds > currentDuration) {
+          alert(`Remaining time cannot exceed level duration (${formatTime(currentDuration)}).`);
+          playSound('C3');
+          return;
+      }
+
+      const newElapsedTime = currentDuration - newRemainingSeconds;
+      setLevelTimeElapsed(newElapsedTime);
+      setIsEditingLevelTime(false);
+      playSound('C5');
+  };
+
+  const handleCancelLevelTimeEdit = () => {
+      setIsEditingLevelTime(false);
+      setEditedLevelTimeInput("");
+      playSound('C3');
+  };
+
+  // --- Inline Blind Editing Handlers ---
+  const handleEditBlind = (blindType) => {
+      // Can only edit if timer paused, not on break, and not editing time/another blind
+      if (!isRunning && !onManualBreak && !onScheduledBreak && !isEditingLevelTime && !editingBlind) {
+          // Allow editing only 'small' or 'big'
+          if (blindType === 'small' || blindType === 'big') {
+              const currentValue = blindLevels[currentLevelIndex]?.[blindType] ?? 0;
+              setEditedBlindValue(currentValue.toString());
+              setEditingBlind(blindType); // Set which blind is being edited
+              playSound('E4');
+          } else {
+              // Ignore clicks on Ante area if we decide to keep it visually but non-editable
+              playSound('C3'); // Optional: sound to indicate non-editable
+          }
+      } else {
+          playSound('C3');
+          alert("Pause the timer, ensure no break is active, and finish other edits to edit blinds.");
+      }
+  };
+
+  const handleSaveBlindEdit = () => {
+      const newValue = parseInt(editedBlindValue, 10);
+
+      if (isNaN(newValue) || newValue < 0) {
+          alert("Invalid blind value. Please enter a non-negative number.");
+          playSound('C3');
+          return;
+      }
+
+      // Create a new array to update state immutably
+      const newBlindLevels = blindLevels.map((level, index) => {
+          if (index === currentLevelIndex) {
+              // Update the specific blind for the current level
+              return { ...level, [editingBlind]: newValue };
+          }
+          return level;
+      });
+
+      setBlindLevels(newBlindLevels); // Update the main blind levels state
+      setEditingBlind(null); // Exit editing mode
+      setEditedBlindValue(""); // Clear input
+      playSound('C5');
+  };
+
+  const handleCancelBlindEdit = () => {
+      setEditingBlind(null);
+      setEditedBlindValue("");
+      playSound('C3');
+  };
+
+
+  // --- Calculated Values ---
+  const currentLevel = blindLevels[currentLevelIndex] ?? { small: 0, big: 0, ante: 0, duration: 0 }; // Provide defaults
+  const levelDuration = currentLevel.duration ?? 0;
+  const isLastLevel = currentLevelIndex >= blindLevels.length - 1;
+
+  // Timer display logic
+  let displayTime = "00:00";
+  let displayTotalTime = "00:00";
+  let timeLabel = "Time";
+  let progressPercent = 0;
+  let isCountingDown = false;
+  let canEdit = !isRunning && !onManualBreak && !onScheduledBreak && !isEditingLevelTime && !editingBlind; // Condition for enabling edits
+
+  if (onManualBreak) {
+    const remaining = Math.max(0, levelTimeElapsed);
+    displayTime = formatTime(remaining);
+    displayTotalTime = formatTime(manualBreakTotalDuration);
+    timeLabel = "Manual Break Remaining";
+    progressPercent = manualBreakTotalDuration > 0 ? (remaining / manualBreakTotalDuration) * 100 : 0;
+    isCountingDown = true;
+  } else if (onScheduledBreak) {
+    const elapsed = Math.min(levelTimeElapsed, currentBreakDuration);
+    displayTime = formatTime(elapsed);
+    displayTotalTime = formatTime(currentBreakDuration);
+    timeLabel = `Scheduled Break (${displayTotalTime})`;
+    progressPercent = currentBreakDuration > 0 ? (elapsed / currentBreakDuration) * 100 : 0;
+    isCountingDown = false;
+  } else {
+    // Regular level
+    const remaining = Math.max(0, levelDuration - levelTimeElapsed);
+    displayTime = formatTime(remaining);
+    displayTotalTime = formatTime(levelDuration);
+    timeLabel = `Level ${currentLevelIndex + 1} Remaining`;
+    progressPercent = levelDuration > 0 ? (levelTimeElapsed / levelDuration) * 100 : 0;
+    isCountingDown = true;
+  }
+
+  const nextLevelInfo = currentLevelIndex + 1 < blindLevels.length ? blindLevels[currentLevelIndex + 1] : null;
+  const upcomingBreakInfo = breaks.find(b => b.afterLevelIndex >= currentLevelIndex);
+
+
+  // --- JSX ---
+  return (
+    // Main container
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 text-white p-4 font-sans antialiased">
+      {/* Max width container */}
+      <div className="max-w-7xl mx-auto">
+
+        {/* Header Section */}
+        <header className="mb-4 flex flex-col sm:flex-row justify-between items-center space-y-2 sm:space-y-0">
+          {/* Tournament Name (Editable) */}
+          <div className="flex items-center space-x-2 group">
+             {isEditingName ? (
+               <div className="flex items-center">
+                 <input type="text" value={editedName} onChange={(e) => setEditedName(e.target.value)} className="bg-gray-700 text-white text-2xl font-bold px-2 py-1 rounded border border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-400" onKeyDown={(e) => { if (e.key === 'Enter') { setTournamentName(editedName); setIsEditingName(false); playSound('C5'); } }} onBlur={() => { setTournamentName(editedName); setIsEditingName(false); }} autoFocus />
+                 <button onClick={() => { setTournamentName(editedName); setIsEditingName(false); playSound('C5'); }} className="ml-2 p-1 text-green-400 hover:text-green-300 transition-colors"> <Check size={24} /> </button>
+                 <button onClick={() => { setEditedName(tournamentName); setIsEditingName(false); playSound('C3');}} className="ml-1 p-1 text-red-400 hover:text-red-300 transition-colors"> <X size={24} /> </button>
+               </div>
+             ) : (
+               <>
+                 <h1 className="text-3xl font-bold text-blue-300 mr-1 truncate" title={tournamentName}>{tournamentName}</h1>
+                 <button onClick={() => { setEditedName(tournamentName); setIsEditingName(true); playSound('E4'); }} className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity p-1 text-blue-400 hover:text-blue-200"> <Edit2 size={20} /> </button>
+               </>
+             )}
+          </div>
+          {/* Header Controls */}
+          <div className="flex items-center space-x-2">
+             <button onClick={handleLoadState} title="Load Last Saved State" className="p-2 bg-gray-700 hover:bg-gray-600 rounded-full transition-colors"><DownloadCloud size={20} /></button>
+             <button onClick={() => setShowSettings(!showSettings)} title="Settings" className="p-2 bg-gray-700 hover:bg-gray-600 rounded-full transition-colors"><Settings size={20} /></button>
+             <button onClick={() => setShowHistory(true)} title="Game History" className="p-2 bg-gray-700 hover:bg-gray-600 rounded-full transition-colors"><History size={20} /></button>
+             <button onClick={() => { setSoundEnabled(!soundEnabled); playSound(soundEnabled ? 'C3' : 'C4'); }} title={soundEnabled ? "Mute Sounds" : "Unmute Sounds"} className="p-2 bg-gray-700 hover:bg-gray-600 rounded-full transition-colors">
+               {soundEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
+             </button>
+             <button onClick={() => document.fullscreenEnabled && document.documentElement.requestFullscreen?.().catch(err => console.error(err))} title="Fullscreen" className="p-2 bg-gray-700 hover:bg-gray-600 rounded-full hidden sm:block transition-colors"><Tv size={20} /></button>
+          </div>
+        </header>
+
+         {/* Settings Panel (Collapsible) */}
+        {showSettings && (
+          <div className="bg-gray-700 p-4 rounded-lg mb-4 shadow-lg ring-1 ring-blue-500/50">
+            <div className="flex justify-between items-center mb-3 border-b border-gray-600 pb-2">
+                <h2 className="text-xl font-semibold text-blue-300">Tournament Settings</h2>
+                <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-white"> <X size={20}/> </button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Starting Players Input */}
+              <div>
+                <label htmlFor="startingPlayers" className="block text-sm font-medium text-gray-300 mb-1">Starting Players</label>
+                <input id="startingPlayers" type="number" min="2" value={startingPlayers} onChange={(e) => { const newStart = parseInt(e.target.value) || 2; setStartingPlayers(newStart); if (playerCount > newStart) { setPlayerCount(newStart); } }} className="w-full p-2 rounded bg-gray-600 border border-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              {/* Edit Blinds Button */}
+               <div>
+                 <label className="block text-sm font-medium text-gray-300 mb-1 opacity-0">_</label> {/* Spacer */}
+                 <button onClick={openLevelEditor} className="w-full flex items-center justify-center p-2 rounded bg-blue-600 hover:bg-blue-700 transition-colors"> <Edit size={16} className="mr-1"/> Edit Blinds </button>
+              </div>
+              {/* Edit Breaks Button */}
+               <div>
+                 <label className="block text-sm font-medium text-gray-300 mb-1">Break Schedule</label>
+                 <button onClick={openBreakEditor} className="w-full flex items-center justify-center p-2 rounded bg-blue-600 hover:bg-blue-700 transition-colors"> <Edit size={16} className="mr-1"/> Edit Breaks </button>
+              </div>
+              {/* Reset Tournament Button */}
+               <div>
+                 <label className="block text-sm font-medium text-gray-300 mb-1">Tournament Control</label>
+                 <button onClick={resetTournament} className="w-full flex items-center justify-center p-2 rounded bg-red-600 hover:bg-red-700 transition-colors"> <RefreshCw size={16} className="mr-1"/> Reset Tournament </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Main Content Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+          {/* === Left Column: Main Display (Blinds & Timers) === */}
+          <div className="lg:col-span-2 space-y-6">
+
+            {/* Current Level/Break Info Card */}
+            <div className={`relative rounded-xl shadow-2xl p-6 flex flex-col justify-between min-h-[400px] ${onManualBreak ? 'bg-gradient-to-br from-purple-600 to-indigo-700' : onScheduledBreak ? 'bg-gradient-to-br from-yellow-500 to-orange-600' : 'bg-gradient-to-br from-blue-600 to-blue-800'}`}>
+              {/* Top Section: Title */}
+              <div className="text-center mb-4 relative">
+                 {onManualBreak ? ( <div className="flex justify-center items-center text-3xl font-bold text-purple-100 animate-pulse"> <Coffee className="w-8 h-8 mr-3" /> MANUAL BREAK </div>
+                 ) : onScheduledBreak ? ( <div className="flex justify-center items-center text-3xl font-bold text-yellow-100 animate-pulse"> <Coffee className="w-8 h-8 mr-3" /> SCHEDULED BREAK </div>
+                 ) : ( <h2 className="text-3xl font-bold text-blue-100"> Level {currentLevelIndex + 1} </h2> )}
+              </div>
+
+              {/* Middle Section: Blinds or Timer */}
+              <div className="flex-grow flex flex-col justify-center">
+                {/* Blinds Display (Editable when paused) */}
+                {!onScheduledBreak && !onManualBreak && (
+                  // Use justify-center if only two items (SB/BB)
+                  <div className="flex justify-center items-start text-center mb-6 py-4 bg-black bg-opacity-20 rounded-lg space-x-8 md:space-x-16 lg:space-x-24">
+                    {/* Small Blind */}
+                    <div className="flex flex-col items-center">
+                      <p className="text-lg text-blue-300 uppercase tracking-wider font-medium mb-1">Small</p>
+                      {editingBlind === 'small' ? (
+                        <div className="flex items-center space-x-1">
+                          <input type="number" min="0" value={editedBlindValue} onChange={(e) => setEditedBlindValue(e.target.value)} className="w-28 p-1 text-5xl lg:text-6xl font-bold text-white tabular-nums bg-gray-900 bg-opacity-50 border border-blue-400 rounded text-center focus:outline-none focus:ring-2 focus:ring-blue-300" autoFocus onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBlindEdit(); if (e.key === 'Escape') handleCancelBlindEdit(); }} />
+                          <button onClick={handleSaveBlindEdit} className="p-1 text-green-400 hover:text-green-300"><Check size={18}/></button>
+                          <button onClick={handleCancelBlindEdit} className="p-1 text-red-400 hover:text-red-300"><X size={18}/></button>
+                        </div>
+                      ) : (
+                        <p className={`text-6xl lg:text-7xl font-bold text-white tabular-nums ${canEdit ? 'cursor-pointer hover:text-blue-200' : ''}`} onClick={() => handleEditBlind('small')} title={canEdit ? "Click to edit Small Blind" : ""}>
+                          {currentLevel.small}
+                        </p>
+                      )}
+                    </div>
+                    {/* Big Blind */}
+                    <div className="flex flex-col items-center">
+                      <p className="text-lg text-blue-300 uppercase tracking-wider font-medium mb-1">Big</p>
+                       {editingBlind === 'big' ? (
+                        <div className="flex items-center space-x-1">
+                          <input type="number" min="0" value={editedBlindValue} onChange={(e) => setEditedBlindValue(e.target.value)} className="w-28 p-1 text-5xl lg:text-6xl font-bold text-white tabular-nums bg-gray-900 bg-opacity-50 border border-blue-400 rounded text-center focus:outline-none focus:ring-2 focus:ring-blue-300" autoFocus onKeyDown={(e) => { if (e.key === 'Enter') handleSaveBlindEdit(); if (e.key === 'Escape') handleCancelBlindEdit(); }} />
+                          <button onClick={handleSaveBlindEdit} className="p-1 text-green-400 hover:text-green-300"><Check size={18}/></button>
+                          <button onClick={handleCancelBlindEdit} className="p-1 text-red-400 hover:text-red-300"><X size={18}/></button>
+                        </div>
+                      ) : (
+                        <p className={`text-6xl lg:text-7xl font-bold text-white tabular-nums ${canEdit ? 'cursor-pointer hover:text-blue-200' : ''}`} onClick={() => handleEditBlind('big')} title={canEdit ? "Click to edit Big Blind" : ""}>
+                          {currentLevel.big}
+                        </p>
+                      )}
+                    </div>
+                    {/* REMOVED ANTE DISPLAY AND EDIT LOGIC */}
+                  </div>
+                )}
+
+                {/* Timer Display / Edit Input */}
+                <div className="text-center mb-4">
+                  {/* Time Label with Edit Button */}
+                  <div className="flex items-center justify-center space-x-2 mb-2">
+                      <p className="text-xl text-gray-200 uppercase tracking-wider">{timeLabel}</p>
+                      {/* Show Edit button only for regular levels when paused and not editing blind */}
+                      {canEdit && !isEditingLevelTime && (
+                          <button
+                              onClick={handleEditLevelTime}
+                              className="p-1 text-blue-300 hover:text-white transition-opacity"
+                              title="Edit Remaining Time"
+                          >
+                              <Edit2 size={18} />
+                          </button>
+                      )}
+                  </div>
+
+                  {/* Conditional Rendering: Display Time or Edit Input */}
+                  {isEditingLevelTime ? (
+                      <div className="flex flex-col items-center space-y-2">
+                          <input type="text" value={editedLevelTimeInput} onChange={(e) => setEditedLevelTimeInput(e.target.value)} placeholder="MM:SS" className="text-6xl lg:text-7xl font-mono font-extrabold tabular-nums bg-gray-900 bg-opacity-50 text-white border border-blue-400 rounded px-4 py-1 w-64 text-center focus:outline-none focus:ring-2 focus:ring-blue-300" autoFocus onKeyDown={(e) => { if (e.key === 'Enter') handleSaveLevelTime(); if (e.key === 'Escape') handleCancelLevelTimeEdit(); }} />
+                          <div className="flex space-x-2">
+                              <button onClick={handleSaveLevelTime} className="px-3 py-1 bg-green-600 hover:bg-green-500 rounded text-white text-sm flex items-center"><Check size={16} className="mr-1"/> Save</button>
+                              <button onClick={handleCancelLevelTimeEdit} className="px-3 py-1 bg-gray-600 hover:bg-gray-500 rounded text-gray-200 text-sm flex items-center"><X size={16} className="mr-1"/> Cancel</button>
+                          </div>
+                      </div>
+                  ) : (
+                      <p className={`text-8xl lg:text-9xl font-mono font-extrabold tabular-nums ${onManualBreak ? 'text-purple-100' : onScheduledBreak ? 'text-yellow-100' : 'text-white'}`}>
+                          {displayTime}
+                      </p>
+                  )}
+                </div>
+              </div>
+
+              {/* Bottom Section: Progress Bar & Total Time */}
+              <div>
+                {/* Progress Bar */}
+                <div className="w-full bg-black bg-opacity-30 rounded-full h-5 overflow-hidden shadow-inner mb-4">
+                  <div className={`h-full rounded-full transition-width duration-1000 ease-linear ${onManualBreak ? 'bg-purple-300' : onScheduledBreak ? 'bg-yellow-300' : 'bg-blue-300'}`} style={{ width: `${isCountingDown ? 100 - progressPercent : progressPercent}%` }} ></div>
+                </div>
+                {/* Total Tournament Time */}
+                <div className="text-center flex items-center justify-center space-x-2 text-xl text-gray-300 opacity-80">
+                   <Clock size={20} />
+                   <span>Total: {formatTime(tournamentTime, true)}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Main Controls Card */}
+            <div className="bg-gray-800 rounded-xl shadow-lg p-4 flex flex-col sm:flex-row justify-between items-center space-y-3 sm:space-y-0">
+               {/* Level Navigation */}
+               <div className="flex space-x-3">
+                 <button onClick={previousLevel} className="flex items-center bg-gray-600 hover:bg-gray-500 text-white px-4 py-3 rounded-lg text-lg shadow transition duration-150 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed" disabled={currentLevelIndex === 0 || isRunning || onManualBreak || onScheduledBreak || isEditingLevelTime || editingBlind} title="Previous Level (Requires Timer Paused & No Edits)"> <SkipBack className="w-6 h-6" /> </button>
+                 <button onClick={nextLevel} className="flex items-center bg-gray-600 hover:bg-gray-500 text-white px-4 py-3 rounded-lg text-lg shadow transition duration-150 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed" disabled={isLastLevel || isRunning || onManualBreak || onScheduledBreak || isEditingLevelTime || editingBlind} title="Next Level (Requires Timer Paused & No Edits)"> <SkipForward className="w-6 h-6" /> </button>
+               </div>
+
+               {/* Play/Pause Button */}
+               <button onClick={toggleTimer} className={`flex items-center justify-center ${isRunning ? 'bg-red-600 hover:bg-red-500' : 'bg-green-600 hover:bg-green-500'} text-white px-8 py-4 rounded-lg text-2xl font-bold shadow-lg transition duration-150 ease-in-out transform hover:scale-105 w-full sm:w-auto order-first sm:order-none disabled:opacity-50 disabled:cursor-not-allowed`} disabled={isEditingLevelTime || editingBlind} title={isEditingLevelTime || editingBlind ? "Finish editing first" : isRunning ? "Pause Tournament" : (onManualBreak || onScheduledBreak) ? "End Break & Resume" : "Start Tournament"}>
+                  {isRunning ? ( <> <Pause className="w-7 h-7 mr-2" /> Pause </>
+                  ) : (onManualBreak || onScheduledBreak) ? ( <> <Play className="w-7 h-7 mr-2" /> End Break </>
+                  ) : ( <> <Play className="w-7 h-7 mr-2" /> Start </> )}
+               </button>
+
+                {/* Save History Button */}
+                 <button onClick={saveTournamentToHistory} className="flex items-center bg-blue-600 hover:bg-blue-500 text-white px-4 py-3 rounded-lg text-lg shadow transition duration-150 ease-in-out disabled:opacity-50" disabled={isEditingLevelTime || editingBlind} title="Save Game to History"> <Save className="w-6 h-6" /> </button>
+            </div>
+
+            {/* Upcoming Level / Break Info Card */}
+            <div className="bg-gray-800 rounded-xl shadow-lg p-4 text-center">
+               <h3 className="text-lg font-semibold text-gray-400 mb-2">Upcoming Info</h3>
+               <div className="flex flex-col sm:flex-row justify-around items-center space-y-2 sm:space-y-0">
+                 {/* Next Level Info - Removed Ante display */}
+                 {nextLevelInfo ? ( <div className="text-blue-300"> <p className="text-xl font-medium">Next Level ({currentLevelIndex + 2})</p> <p className="text-lg">{nextLevelInfo.small} / {nextLevelInfo.big}</p> <p className="text-md">Duration: {formatTime(nextLevelInfo.duration)}</p> </div>
+                 ) : !isLastLevel ? ( <p className="text-gray-500">Loading next level...</p>
+                 ) : ( <p className="text-green-400 text-xl font-semibold">Final Level!</p> )}
+                 {/* Upcoming Break Info */}
+                 {upcomingBreakInfo && ( <div className="text-yellow-400 border-t sm:border-t-0 sm:border-l border-gray-600 pt-2 sm:pt-0 sm:pl-4 mt-2 sm:mt-0"> <p className="text-xl font-medium"> <Coffee size={20} className="inline mr-1"/> Next Break</p> <p className="text-lg">After Level {upcomingBreakInfo.afterLevelIndex + 1}</p> <p className="text-md">Duration: {formatTime(upcomingBreakInfo.duration)}</p> </div> )}
+               </div>
+            </div>
+          </div> {/* End Left Column */}
+
+          {/* === Right Column: Players & Controls === */}
+          <div className="space-y-6">
+
+            {/* Player Info Card */}
+            <div className="bg-gray-800 rounded-xl shadow-lg p-6 text-center">
+               <h3 className="text-xl font-semibold text-gray-300 mb-2 flex items-center justify-center"> <Users className="w-6 h-6 mr-2 text-blue-400" /> Players </h3>
+               <div className="text-7xl font-bold text-white mb-4 tabular-nums"> {playerCount} <span className="text-3xl text-gray-400"> / {startingPlayers}</span> </div>
+               <div className="mt-4 space-y-2">
+                  <input type="text" value={playerToEliminate} onChange={(e) => setPlayerToEliminate(e.target.value)} placeholder="Eliminated player name" className="w-full px-3 py-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-gray-500 text-center" onKeyDown={(e) => { if (e.key === 'Enter') eliminatePlayer(); }} />
+                  <button onClick={eliminatePlayer} className="w-full bg-red-600 hover:bg-red-500 text-white px-4 py-3 rounded-lg font-semibold shadow transition duration-150 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center" disabled={playerCount <= 1 || playerToEliminate.trim() === ""} title={playerCount <= 1 ? "Tournament finished" : "Eliminate Player"}> <PowerOff className="w-5 h-5 mr-2" /> Eliminate </button>
+                </div>
+            </div>
+
+            {/* Manual Break Control Card */}
+            <div className="bg-gray-800 rounded-xl shadow-lg p-4">
+               <h3 className="text-lg font-semibold text-gray-300 mb-3 text-center">Manual Break Control</h3>
+               <div className="flex items-center space-x-2">
+                 <input type="number" min="1" value={manualBreakInputMinutes} onChange={(e) => setManualBreakInputMinutes(parseInt(e.target.value) || 1)} className="w-20 px-2 py-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-purple-500 text-center tabular-nums" disabled={onManualBreak || isRunning || isEditingLevelTime || editingBlind} />
+                 <span className="text-gray-400">min</span>
+                 {!onManualBreak ? ( <button onClick={startManualBreak} className="flex-1 bg-purple-600 hover:bg-purple-500 text-white px-3 py-2 rounded-lg shadow flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors" disabled={isRunning || isEditingLevelTime || editingBlind} title={isRunning ? "Pause tournament first" : (isEditingLevelTime || editingBlind) ? "Finish editing first" : "Start Manual Break"}> <Coffee size={18} className="mr-1"/> Start Break </button>
+                  ) : ( <button onClick={endManualBreak} className="flex-1 bg-red-600 hover:bg-red-500 text-white px-3 py-2 rounded-lg shadow flex items-center justify-center transition-colors" title="End Manual Break Early"> <X size={18} className="mr-1"/> End Break Now </button> )}
+               </div>
+               {(isRunning || isEditingLevelTime || editingBlind) && !onManualBreak && ( <p className="text-xs text-yellow-400 text-center mt-2">Pause timer & finish edits first.</p> )}
+            </div>
+
+            {/* Player Clock (Call the Clock) Card */}
+            <div className="bg-gray-800 rounded-xl shadow-lg p-4">
+              <h3 className="text-lg font-semibold text-gray-300 mb-3 text-center">Player Action Clock</h3>
+              <div className="text-center mb-3"> <span className={`text-6xl font-mono font-bold tabular-nums transition-colors ${playerClockTime <= 10 && playerClockRunning && !playerClockPaused ? 'text-red-500 animate-pulse' : playerClockTime <= 30 && playerClockRunning && !playerClockPaused ? 'text-yellow-500' : 'text-white'}`}> {playerClockTime} </span> <span className="text-3xl text-gray-400">s</span> </div>
+              <div className="grid grid-cols-3 gap-2">
+                 <button onClick={startPlayerClock} disabled={playerClockRunning} className="bg-blue-600 hover:bg-blue-500 text-white p-3 rounded-lg shadow flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors" title="Start Player Clock (60s)"> <PlayCircle size={20} /> </button>
+                 <button onClick={togglePausePlayerClock} disabled={!playerClockRunning} className={`${playerClockPaused ? 'bg-yellow-500 hover:bg-yellow-400' : 'bg-gray-600 hover:bg-gray-500'} text-white p-3 rounded-lg shadow flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors`} title={playerClockPaused ? "Resume Clock" : "Pause Clock"}> {playerClockPaused ? <PlayCircle size={20} /> : <PauseCircle size={20} />} </button>
+                 <button onClick={stopPlayerClock} disabled={!playerClockRunning} className="bg-red-600 hover:bg-red-500 text-white p-3 rounded-lg shadow flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors" title="Cancel Player Clock"> <X size={20} /> </button>
+              </div>
+            </div>
+
+            {/* Eliminated Players Card */}
+            <div className="bg-gray-800 rounded-xl shadow-lg p-4">
+              <h3 className="text-lg font-semibold text-gray-300 mb-2 flex items-center"> <Award className="w-5 h-5 mr-2 text-yellow-400" /> Eliminations / Payouts </h3>
+              {eliminatedPlayers.length > 0 ? (
+                <div className="max-h-60 overflow-y-auto border border-gray-700 rounded-md p-1 bg-gray-900/30">
+                  <table className="min-w-full text-sm">
+                    <thead className="sticky top-0 bg-gray-700 z-10"> <tr> <th className="text-center font-medium text-gray-300 uppercase px-2 py-1 w-1/6">Pos</th> <th className="text-left font-medium text-gray-300 uppercase px-2 py-1 w-3/6">Player</th> <th className="text-right font-medium text-gray-300 uppercase px-2 py-1 w-2/6">Time</th> </tr> </thead>
+                    <tbody className="divide-y divide-gray-700">
+                      {eliminatedPlayers.map((player, index) => ( <tr key={index} className="hover:bg-gray-700/50"> <td className="px-2 py-1.5 text-gray-200 font-medium text-center">{player.position}</td> <td className="px-2 py-1.5 text-gray-100 truncate" title={player.name}>{player.name}</td> <td className="px-2 py-1.5 text-gray-400 text-right font-mono">{player.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td> </tr> ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : ( <p className="text-gray-500 text-center py-4 italic">No players eliminated yet.</p> )}
+            </div>
+
+          </div> {/* End Right Column */}
+        </div> {/* End Main Grid */}
+
+        {/* --- Modals --- */}
+
+        {/* Level Editor Modal (Ante column still exists here) */}
+        {showLevelEditor && (
+          <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col ring-1 ring-blue-500/50">
+              <div className="p-4 border-b border-gray-700 flex justify-between items-center"> <h2 className="text-xl font-bold text-blue-300">Edit Blind Structure</h2> <button onClick={() => setShowLevelEditor(false)} className="text-gray-400 hover:text-white transition-colors"> <X size={24} /> </button> </div>
+              <div className="p-4 overflow-y-auto flex-grow"> <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-700">
+                    <thead className="bg-gray-700 sticky top-0 z-10"> <tr> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Lvl</th> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Small</th> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Big</th> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Ante</th> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Duration (min)</th> <th className="px-3 py-2 text-center text-xs font-medium text-gray-400 uppercase tracking-wider">Actions</th> </tr> </thead>
+                    <tbody className="divide-y divide-gray-700">
+                      {tempBlindLevels.map((level, index) => (
+                        <tr key={index} className={`${editingLevelIndex === index ? "bg-blue-900 bg-opacity-50" : "hover:bg-gray-700/50"} transition-colors`}>
+                          {editingLevelIndex === index ? ( <> <td className="px-3 py-2 whitespace-nowrap text-sm font-medium text-gray-200">{index + 1}</td> <td className="px-3 py-1"><input type="number" min="0" value={level.small} onChange={(e) => handleLevelEditChange(index, 'small', e.target.value)} className="w-20 p-1 rounded bg-gray-600 border border-gray-500 focus:ring-blue-500 focus:border-blue-500"/></td> <td className="px-3 py-1"><input type="number" min="0" value={level.big} onChange={(e) => handleLevelEditChange(index, 'big', e.target.value)} className="w-20 p-1 rounded bg-gray-600 border border-gray-500 focus:ring-blue-500 focus:border-blue-500"/></td> <td className="px-3 py-1"><input type="number" min="0" value={level.ante} onChange={(e) => handleLevelEditChange(index, 'ante', e.target.value)} className="w-20 p-1 rounded bg-gray-600 border border-gray-500 focus:ring-blue-500 focus:border-blue-500"/></td> <td className="px-3 py-1"><input type="number" min="1" value={Math.floor(level.duration / 60)} onChange={(e) => handleLevelEditChange(index, 'duration', e.target.value)} className="w-20 p-1 rounded bg-gray-600 border border-gray-500 focus:ring-blue-500 focus:border-blue-500"/></td> <td className="px-3 py-1 whitespace-nowrap text-center"> <button onClick={() => setEditingLevelIndex(null)} className="text-green-400 hover:text-green-300 p-1 transition-colors" title="Save Row Changes"> <Check size={18}/> </button> </td> </>
+                          ) : ( <> <td className="px-3 py-2 whitespace-nowrap text-sm font-medium text-gray-200">{index + 1}</td> <td className="px-3 py-2 text-sm text-gray-300">{level.small}</td> <td className="px-3 py-2 text-sm text-gray-300">{level.big}</td> <td className="px-3 py-2 text-sm text-gray-300">{level.ante}</td> <td className="px-3 py-2 text-sm text-gray-300">{Math.floor(level.duration / 60)} min</td> <td className="px-3 py-2 whitespace-nowrap text-sm text-center space-x-2"> <button onClick={() => setEditingLevelIndex(index)} className="text-blue-400 hover:text-blue-300 p-1 transition-colors" title="Edit Row"> <Edit size={16}/> </button> {tempBlindLevels.length > 1 && ( <button onClick={() => removeLevel(index)} className="text-red-400 hover:text-red-300 p-1 transition-colors" title="Remove Row"> <Trash2 size={16}/> </button> )} </td> </> )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+              </div> </div>
+              <div className="p-4 border-t border-gray-700 flex justify-between items-center"> <button onClick={addLevel} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded flex items-center transition-colors"> <Plus size={16} className="mr-1"/> Add Level </button> <div> <button onClick={saveLevelChanges} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded mr-2 transition-colors"> Save Structure </button> <button onClick={() => setShowLevelEditor(false)} className="bg-gray-600 hover:bg-gray-500 text-gray-200 px-4 py-2 rounded transition-colors"> Close </button> </div> </div>
+            </div>
+          </div>
+        )}
+
+        {/* Break Editor Modal */}
+        {showBreakEditor && (
+           <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col ring-1 ring-blue-500/50">
+              <div className="p-4 border-b border-gray-700 flex justify-between items-center"> <h2 className="text-xl font-bold text-blue-300">Edit Break Schedule</h2> <button onClick={() => setShowBreakEditor(false)} className="text-gray-400 hover:text-white transition-colors"> <X size={24} /> </button> </div>
+              <div className="p-4 overflow-y-auto flex-grow">
+                 <table className="min-w-full divide-y divide-gray-700">
+                    <thead className="bg-gray-700 sticky top-0 z-10"> <tr> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">After Level</th> <th className="px-3 py-2 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Duration (min)</th> <th className="px-3 py-2 text-center text-xs font-medium text-gray-400 uppercase tracking-wider">Actions</th> </tr> </thead>
+                    <tbody className="divide-y divide-gray-700">
+                      {tempBreaks.map((breakItem, index) => (
+                        <tr key={index} className={`${editingBreakIndex === index ? "bg-blue-900 bg-opacity-50" : "hover:bg-gray-700/50"} transition-colors`}>
+                          {editingBreakIndex === index ? ( <> <td className="px-3 py-1"> <input type="number" min="1" value={breakItem.afterLevelIndex + 1} onChange={(e) => handleBreakEditChange(index, 'afterLevelIndex', e.target.value)} className="w-20 p-1 rounded bg-gray-600 border border-gray-500 focus:ring-blue-500 focus:border-blue-500"/> </td> <td className="px-3 py-1"> <input type="number" min="1" value={Math.floor(breakItem.duration / 60)} onChange={(e) => handleBreakEditChange(index, 'duration', e.target.value)} className="w-20 p-1 rounded bg-gray-600 border border-gray-500 focus:ring-blue-500 focus:border-blue-500"/> </td> <td className="px-3 py-1 whitespace-nowrap text-center"> <button onClick={() => setEditingBreakIndex(null)} className="text-green-400 hover:text-green-300 p-1 transition-colors" title="Save Row Changes"> <Check size={18}/> </button> </td> </>
+                          ) : ( <> <td className="px-3 py-2 text-sm text-gray-300">{breakItem.afterLevelIndex + 1}</td> <td className="px-3 py-2 text-sm text-gray-300">{Math.floor(breakItem.duration / 60)} min</td> <td className="px-3 py-2 whitespace-nowrap text-sm text-center space-x-2"> <button onClick={() => setEditingBreakIndex(index)} className="text-blue-400 hover:text-blue-300 p-1 transition-colors" title="Edit Row"> <Edit size={16}/> </button> <button onClick={() => removeBreak(index)} className="text-red-400 hover:text-red-300 p-1 transition-colors" title="Remove Row"> <Trash2 size={16}/> </button> </td> </> )}
+                        </tr>
+                      ))}
+                    </tbody>
+                 </table>
+                 {tempBreaks.length === 0 && ( <p className="text-center text-gray-500 py-4 italic">No scheduled breaks.</p> )}
+              </div>
+              <div className="p-4 border-t border-gray-700 flex justify-between items-center"> <button onClick={addBreak} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded flex items-center transition-colors"> <Plus size={16} className="mr-1"/> Add Break </button> <div> <button onClick={saveBreakChanges} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded mr-2 transition-colors"> Save Schedule </button> <button onClick={() => setShowBreakEditor(false)} className="bg-gray-600 hover:bg-gray-500 text-gray-200 px-4 py-2 rounded transition-colors"> Close </button> </div> </div>
+            </div>
+           </div>
+        )}
+
+        {/* Game History Modal */}
+        {showHistory && (
+          <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col ring-1 ring-blue-500/50">
+              <div className="p-4 border-b border-gray-700 flex justify-between items-center"> <h2 className="text-xl font-bold text-blue-300">Game History</h2> <button onClick={() => setShowHistory(false)} className="text-gray-400 hover:text-white transition-colors"> <X size={24} /> </button> </div>
+              <div className="p-4 overflow-y-auto flex-grow space-y-4">
+                {gameHistory.length === 0 ? ( <p className="text-center text-gray-500 py-8 italic">No game history available yet.</p>
+                ) : ( gameHistory.map((game, index) => (
+                    <div key={game.id || index} className="border border-gray-700 rounded-lg overflow-hidden bg-gray-700 bg-opacity-50">
+                      <div className="p-3 flex flex-col sm:flex-row justify-between items-start sm:items-center bg-gray-700"> <div> <h3 className="font-bold text-lg text-white">{game.name}</h3> <p className="text-sm text-gray-400">{new Date(game.date).toLocaleString()}</p> </div> <div className="text-left sm:text-right mt-2 sm:mt-0"> <p className="font-medium text-gray-200">Duration: {formatTime(game.duration, true)}</p> <p className="text-sm text-gray-400"> Players: {game.players.starting} → {game.players.final} </p> </div> </div>
+                      <div className="p-3"> <div className="flex justify-between items-center mb-2"> <h4 className="font-medium text-gray-300">Results</h4> {game.winner && game.winner !== "Unknown" && game.winner !== "In Progress / Unknown" && ( <div className="flex items-center text-yellow-400"> <Award className="w-4 h-4 mr-1" /> <span className="font-medium">Winner: {game.winner}</span> </div> )} </div>
+                        {game.eliminated && game.eliminated.length > 0 ? ( <div className="max-h-48 overflow-y-auto border border-gray-600 rounded p-1 bg-gray-900/30">
+                            <table className="min-w-full text-sm">
+                              <thead className="sticky top-0 bg-gray-700 z-10"> <tr> <th className="text-center font-medium text-gray-400 uppercase px-2 py-1 w-1/6">Pos</th> <th className="text-left font-medium text-gray-400 uppercase px-2 py-1 w-3/6">Player</th> <th className="text-right font-medium text-gray-400 uppercase px-2 py-1 w-2/6">Time</th> </tr> </thead>
+                              <tbody className="divide-y divide-gray-600">
+                                {game.eliminated.sort((a,b) => b.position - a.position).map((player, idx) => ( <tr key={idx} className="hover:bg-gray-600/50"> <td className="px-2 py-1 text-gray-200 text-center">{player.position}</td> <td className="px-2 py-1 text-gray-100 font-medium truncate" title={player.name}>{player.name}</td> <td className="px-2 py-1 text-gray-400 text-right font-mono">{new Date(player.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td> </tr> ))}
+                              </tbody>
+                            </table> </div>
+                        ) : ( <p className="text-gray-500 text-center py-2 italic">No elimination data recorded for this game.</p> )}
+                      </div> </div> )) )}
+              </div>
+              <div className="p-4 border-t border-gray-700 flex justify-end space-x-2"> <button onClick={() => { if (window.confirm("Clear ALL game history? This cannot be undone.")) { setGameHistory([]); playSound('C3'); localStorage.removeItem(LOCAL_STORAGE_KEY_HISTORY); } }} className="bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded flex items-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors" disabled={gameHistory.length === 0} title="Clear All History"> <Trash2 size={16} className="mr-1"/> Clear History </button> <button onClick={() => setShowHistory(false)} className="bg-gray-600 hover:bg-gray-500 text-gray-200 px-4 py-2 rounded transition-colors"> Close </button> </div>
+            </div>
+          </div>
+        )}
+
+      </div> {/* End max-w container */}
+    </div> // End main wrapper
+  );
+};
+
+export default PokerTournamentHUD;
